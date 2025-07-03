@@ -27,11 +27,11 @@ uv tool install .
 From pypi:
 
 ```bash
-uv tool install mcpie
+uv tool install mcpie-cli
 ```
 
 ```bash
-uvx mcpie
+uvx mcpie-cli
 ```
 
 ## Quick Start
