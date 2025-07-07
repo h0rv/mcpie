@@ -11,13 +11,13 @@ import asyncio
 import json
 import shlex
 import sys
-from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import click
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import Result
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
@@ -27,8 +27,8 @@ from prompt_toolkit.styles import Style
 from pygments.lexers.data import JsonLexer
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 from rich.syntax import Syntax
+from rich.table import Table
 
 console = Console()
 
@@ -36,7 +36,7 @@ console = Console()
 class CommandConfig:
     """Configuration for a command type."""
 
-    def __init__(self, name: str, aliases: List[str], subcommands: Dict[str, Any]):
+    def __init__(self, name: str, aliases: list[str], subcommands: dict[str, object]):
         self.name = name
         self.aliases = aliases
         self.subcommands = subcommands
@@ -138,7 +138,7 @@ class MCPCompleter(Completer):
         except:  # noqa: E722
             pass
 
-    async def _get_tools(self) -> List[str]:
+    async def _get_tools(self) -> list[str]:
         """Get list of available tool names."""
         if self._tools_cache is None and self.session.initialized:
             try:
@@ -155,7 +155,7 @@ class MCPCompleter(Completer):
                 self._tools_cache = []
         return self._tools_cache or []
 
-    async def _get_prompts(self) -> List[str]:
+    async def _get_prompts(self) -> list[str]:
         """Get list of available prompt names."""
         if self._prompts_cache is None and self.session.initialized:
             try:
@@ -172,7 +172,7 @@ class MCPCompleter(Completer):
                 self._prompts_cache = []
         return self._prompts_cache or []
 
-    async def _get_resources(self) -> List[str]:
+    async def _get_resources(self) -> list[str]:
         """Get list of available resource URIs."""
         if self._resources_cache is None and self.session.initialized:
             try:
@@ -284,46 +284,49 @@ class MCPCompleter(Completer):
 class MCPSession:
     """Interactive MCP session manager."""
 
-    def __init__(self, cmd_or_url: str, metadata: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        cmd_or_url: str,
+        metadata: dict[str, str] | None = None,
+        force_sse: bool = False,
+    ):
         self.cmd_or_url = cmd_or_url
         self.metadata = metadata or {}
-        self.session: Optional[ClientSession] = None
+        self.force_sse = force_sse  # Force SSE instead of Streamable HTTP
+        self.session: ClientSession | None = None
         self.client = None
         self.initialized = False
         self.server_info = None
         self.clean_output = False
+        self.session_id_callback = None  # For Streamable HTTP
 
     async def connect(self) -> None:
         """Initialize connection to MCP server."""
         try:
             if self.cmd_or_url.startswith(("http://", "https://")):
-                # SSE transport - Auto-handle endpoint detection like the blog post describes
+                # HTTP transport - try Streamable HTTP first, fallback to SSE
                 url = self.cmd_or_url
-                if not url.endswith("/sse"):
-                    url = urljoin(url, "/sse")
-                    console.print(f"[cyan]→ Auto-detecting SSE endpoint: {url}[/cyan]")
                 headers = self.metadata or None
-                self.client = sse_client(url=url, headers=headers)
+
+                if self.force_sse:
+                    console.print("[cyan]→ Using SSE transport (forced)[/cyan]")
+                    await self._connect_sse(url, headers)
+                else:
+                    try:
+                        console.print(
+                            "[cyan]→ Attempting Streamable HTTP transport...[/cyan]"
+                        )
+                        await self._connect_streamable_http(url, headers)
+                    except Exception as e:
+                        console.print(
+                            f"[yellow]→ Streamable HTTP failed ({e}), falling back to SSE...[/yellow]"
+                        )
+                        await self._connect_sse(url, headers)
             else:
                 # STDIO transport
-                elements = shlex.split(self.cmd_or_url)
-                if not elements:
-                    raise ValueError("stdio command is empty")
-
-                command, args = elements[0], elements[1:]
-                server_params = StdioServerParameters(
-                    command=command,
-                    args=args,
-                    env=self.metadata or None,
-                )
-                self.client = stdio_client(server_params)
+                await self._connect_stdio()
 
             # Initialize session
-            console.print("[cyan]→ Establishing connection...[/cyan]")
-            read, write = await self.client.__aenter__()
-            self.session = ClientSession(read, write)
-            await self.session.__aenter__()
-
             console.print("[cyan]→ Initializing MCP session...[/cyan]")
             init_result = await self.session.initialize()
             self.server_info = init_result
@@ -369,8 +372,15 @@ class MCPSession:
                             server_name = server_info.name
                             server_version = getattr(server_info, "version", "Unknown")
 
+                        # Show session ID if using Streamable HTTP
+                        session_info = ""
+                        if self.session_id_callback:
+                            session_id = self.session_id_callback()
+                            if session_id:
+                                session_info = f" (Session: {session_id[:8]}...)"
+
                         console.print(
-                            f"[dim]Server: {server_name} v{server_version} (Protocol: {protocol_version or 'Unknown'})[/dim]"
+                            f"[dim]Server: {server_name} v{server_version} (Protocol: {protocol_version or 'Unknown'}){session_info}[/dim]"
                         )
                 except Exception:
                     # If we can't parse server info, just continue silently
@@ -379,6 +389,61 @@ class MCPSession:
         except Exception as e:
             console.print(f"[red]✗ Failed to connect: {e}[/red]")
             raise
+
+    async def _connect_streamable_http(
+        self, url: str, headers: dict[str, str] | None = None
+    ) -> None:
+        """Connect using Streamable HTTP transport."""
+        # Streamable HTTP typically uses a /mcp endpoint (FastMCP default)
+        # but can also be /message or other paths depending on implementation
+        streamable_paths = ["/mcp", "/message", "/messages"]
+
+        if not any(url.endswith(path) for path in streamable_paths):
+            # Try /mcp first (FastMCP default), then fallback to /message
+            if url.endswith("/"):
+                url = url + "mcp"
+            else:
+                url = url + "/mcp"
+            console.print(
+                f"[cyan]→ Auto-detecting Streamable HTTP endpoint: {url}[/cyan]"
+            )
+
+        self.client = streamablehttp_client(url=url, headers=headers)
+        read, write, session_id_callback = await self.client.__aenter__()
+        self.session = ClientSession(read, write)
+        self.session_id_callback = session_id_callback
+        await self.session.__aenter__()
+
+    async def _connect_sse(
+        self, url: str, headers: dict[str, str] | None = None
+    ) -> None:
+        """Connect using SSE transport."""
+        # SSE transport - Auto-handle endpoint detection like the blog post describes
+        if not url.endswith("/sse"):
+            url = urljoin(url, "/sse")
+            console.print(f"[cyan]→ Auto-detecting SSE endpoint: {url}[/cyan]")
+
+        self.client = sse_client(url=url, headers=headers)
+        read, write = await self.client.__aenter__()
+        self.session = ClientSession(read, write)
+        await self.session.__aenter__()
+
+    async def _connect_stdio(self) -> None:
+        """Connect using STDIO transport."""
+        elements = shlex.split(self.cmd_or_url)
+        if not elements:
+            raise ValueError("stdio command is empty")
+
+        command, args = elements[0], elements[1:]
+        server_params = StdioServerParameters(
+            command=command,
+            args=args,
+            env=self.metadata or None,
+        )
+        self.client = stdio_client(server_params)
+        read, write = await self.client.__aenter__()
+        self.session = ClientSession(read, write)
+        await self.session.__aenter__()
 
     async def disconnect(self) -> None:
         """Close the MCP session."""
@@ -422,7 +487,7 @@ class MCPSession:
 
         raise ValueError(f"Unknown command: {cmd_type} {subcmd}")
 
-    async def get_tool_schema(self, tool_name: str) -> Optional[Dict[str, Any]]:
+    async def get_tool_schema(self, tool_name: str) -> dict[str, object] | None:
         """Get the input schema for a tool."""
         try:
             result = await self.execute_command("tools", "list")
@@ -434,7 +499,7 @@ class MCPSession:
             pass
         return None
 
-    async def get_tool_info(self, tool_name: str) -> Optional[Dict[str, Any]]:
+    async def get_tool_info(self, tool_name: str) -> dict[str, object] | None:
         """Get detailed information about a tool."""
         try:
             result = await self.execute_command("tools", "list")
@@ -452,7 +517,7 @@ class MCPSession:
 
     async def get_prompt_schema(
         self, prompt_name: str
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> list[dict[str, object]] | None:
         """Get the arguments schema for a prompt."""
         try:
             result = await self.execute_command("prompts", "list")
@@ -464,7 +529,7 @@ class MCPSession:
             pass
         return None
 
-    async def get_prompt_info(self, prompt_name: str) -> Optional[Dict[str, Any]]:
+    async def get_prompt_info(self, prompt_name: str) -> dict[str, object] | None:
         """Get detailed information about a prompt."""
         try:
             result = await self.execute_command("prompts", "list")
@@ -480,7 +545,7 @@ class MCPSession:
             pass
         return None
 
-    async def get_resource_info(self, resource_uri: str) -> Optional[Dict[str, Any]]:
+    async def get_resource_info(self, resource_uri: str) -> dict[str, object] | None:
         """Get detailed information about a resource."""
         try:
             result = await self.execute_command("resources", "list")
@@ -574,7 +639,7 @@ def print_result(result: Result, title: str = "Result") -> None:
     console.print(panel)
 
 
-def print_table(data: List[Any], title: str, columns: List[str]) -> None:
+def print_table(data: list[object], title: str, columns: list[str]) -> None:
     """Print data in a table format."""
     if not data:
         console.print(f"[yellow]No {title.lower()} available[/yellow]")
@@ -608,7 +673,7 @@ def print_table(data: List[Any], title: str, columns: List[str]) -> None:
     console.print(table)
 
 
-def print_inspection(info: Dict[str, Any], title: str) -> None:
+def print_inspection(info: dict[str, object], title: str) -> None:
     """Print detailed inspection information."""
     table = Table(title=f"{title} Details", show_header=True, header_style="bold cyan")
     table.add_column("Property", style="bold")
@@ -627,8 +692,8 @@ def print_inspection(info: Dict[str, Any], title: str) -> None:
 
 
 def parse_arguments_smart(
-    arg_str: str, schema: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+    arg_str: str, schema: dict[str, object] | None = None
+) -> dict[str, object]:
     """Parse arguments with smart inference for simple cases."""
     if not arg_str.strip():
         return {}
@@ -682,7 +747,7 @@ def parse_arguments_smart(
 
 async def prompt_for_arguments(
     session: MCPSession, cmd_type: str, name: str
-) -> Dict[str, Any]:
+) -> dict[str, object]:
     """Interactively prompt for required arguments."""
     arguments = {}
 
@@ -865,7 +930,7 @@ def show_help() -> None:
   Interactive:         Leave empty to be prompted for required args
 
 [bold]Pain-Free Features:[/bold]
-  ✓ Auto-detects SSE endpoints (/sse)
+  ✓ Auto-detects Streamable HTTP (/message) and SSE (/sse) endpoints
   ✓ Manages sessions automatically
   ✓ Tab completion for tool/prompt/resource names
   ✓ Smart argument parsing and type conversion
@@ -886,7 +951,7 @@ def show_help() -> None:
     console.print(Panel(help_text, title="Help", border_style="green"))
 
 
-async def handle_command(mcp_session: MCPSession, cmd: str, parts: List[str]) -> None:
+async def handle_command(mcp_session: MCPSession, cmd: str, parts: list[str]) -> None:
     """Handle a command using the abstracted command system."""
 
     # Handle special commands
@@ -1049,7 +1114,7 @@ async def handle_command(mcp_session: MCPSession, cmd: str, parts: List[str]) ->
                                 indent=2, exclude_defaults=True
                             )
                         else:
-                            # Dict or other object
+                            # dict or other object
                             json_str = json.dumps(capabilities, indent=2, default=str)
 
                         syntax = Syntax(json_str, "json", theme="monokai")
@@ -1202,7 +1267,7 @@ async def run_repl(mcp_session: MCPSession) -> None:
     help="Environment variables (key:value) for STDIO transport",
 )
 @click.option(
-    "--header", "-H", multiple=True, help="HTTP headers (key:value) for SSE transport"
+    "--header", "-H", multiple=True, help="HTTP headers (key:value) for HTTP transport"
 )
 @click.option(
     "--verbose",
@@ -1210,32 +1275,42 @@ async def run_repl(mcp_session: MCPSession) -> None:
     is_flag=True,
     help="Use rich formatting and detailed output (default: clean output)",
 )
+@click.option(
+    "--force-sse",
+    is_flag=True,
+    help="Force SSE transport instead of Streamable HTTP for HTTP URLs",
+)
 @click.argument("commands", nargs=-1, required=False)
 def main(
     cmd_or_url: str,
-    env: Tuple[str],
-    header: Tuple[str],
+    env: tuple[str],
+    header: tuple[str],
     verbose: bool,
-    commands: Tuple[str],
+    force_sse: bool,
+    commands: tuple[str],
 ):
     """Interactive MCP client with REPL interface and command-line execution.
 
     Eliminates the pain points of manual MCP interaction:
-    • Auto-detects SSE endpoints
+    • Auto-detects Streamable HTTP and SSE endpoints
     • Manages sessions automatically
     • Provides discovery and inspection tools
     • Smart argument parsing and completion
     • Interactive prompting for parameters
 
     INTERACTIVE MODE (always uses rich formatting):
-      python main.py "http://localhost:5001"
-      python main.py "python server.py"
+      python main.py "http://localhost:5001"      # Streamable HTTP transport
+      python main.py "python server.py"           # STDIO transport
 
     COMMAND-LINE MODE (clean output by default):
       python main.py "uv run server.py" -- tool call add 9 10
       python main.py "http://localhost:5001" -- discover
       python main.py "python server.py" -- tool list | jq '.tools[].name'
       echo "config://app" | python main.py "server.py" -- resource read
+
+    TRANSPORT OPTIONS:
+      HTTP URLs: Uses Streamable HTTP by default, falls back to SSE
+      Use --force-sse to explicitly use SSE transport for HTTP URLs
 
     Use '--' to separate server command from MCP commands to execute.
     Use --verbose for rich formatting in command-line mode.
@@ -1249,7 +1324,7 @@ def main(
             metadata[key] = value
 
     async def run():
-        mcp_session = MCPSession(cmd_or_url, metadata)
+        mcp_session = MCPSession(cmd_or_url, metadata, force_sse)
         # In interactive mode, always use rich output
         # In command-line mode, use clean output unless --verbose
         mcp_session.clean_output = not verbose and bool(commands)
@@ -1275,7 +1350,7 @@ def main(
         sys.exit(1)
 
 
-async def run_commands(mcp_session: MCPSession, commands: Tuple[str]) -> None:
+async def run_commands(mcp_session: MCPSession, commands: tuple[str]) -> None:
     """Execute commands in non-interactive mode."""
     # Join all command arguments into a single command string
     command_string = " ".join(commands)
