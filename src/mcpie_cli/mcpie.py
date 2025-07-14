@@ -14,6 +14,7 @@ import sys
 from urllib.parse import urljoin
 
 import click
+import yaml
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
@@ -31,6 +32,328 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 console = Console()
+
+
+class OutputConfig:
+    """Configuration for output formatting."""
+
+    def __init__(
+        self, output_format: str, quiet: bool, verbose: bool, output_file: str | None
+    ):
+        self.output_format = output_format
+        self.quiet = quiet
+        self.verbose = verbose
+        self.output_file = output_file
+
+
+class BaseOutputFormatter:
+    """Base class for output formatters."""
+
+    def __init__(self, config: OutputConfig):
+        self.config = config
+        self.output_stream = None
+        if config.output_file:
+            self.output_stream = open(config.output_file, "w")
+
+    def __del__(self):
+        if self.output_stream:
+            self.output_stream.close()
+
+    def write(self, content: str):
+        """Write content to appropriate stream."""
+        if self.output_stream:
+            self.output_stream.write(content)
+            self.output_stream.flush()
+        else:
+            print(content, end="")
+
+    def format_result(self, result: Result, title: str = "Result") -> str:
+        """Format a result object."""
+        raise NotImplementedError
+
+    def format_list(self, items: list, title: str, columns: list[str]) -> str:
+        """Format a list of items."""
+        raise NotImplementedError
+
+    def format_error(self, error: str):
+        """Format an error message."""
+        if not self.config.quiet:
+            print(f"Error: {error}", file=sys.stderr)
+
+
+class JsonOutputFormatter(BaseOutputFormatter):
+    """JSON output formatter."""
+
+    def format_result(self, result: Result, title: str = "Result") -> str:
+        if not result:
+            return "{}"
+
+        result_dict = result.model_dump(exclude_defaults=True)
+        return json.dumps(result_dict, indent=None)
+
+    def format_list(self, items: list, title: str, columns: list[str]) -> str:
+        if not items:
+            return "[]"
+
+        formatted_items = []
+        for item in items:
+            if hasattr(item, "model_dump"):
+                formatted_items.append(item.model_dump(exclude_defaults=True))
+            elif isinstance(item, dict):
+                formatted_items.append(item)
+            else:
+                # Convert to dict using specified columns
+                item_dict = {}
+                for col in columns:
+                    if hasattr(item, col):
+                        item_dict[col] = getattr(item, col)
+                formatted_items.append(item_dict)
+
+        return json.dumps(formatted_items, indent=None)
+
+
+class PrettyOutputFormatter(BaseOutputFormatter):
+    """Pretty JSON output formatter."""
+
+    def format_result(self, result: Result, title: str = "Result") -> str:
+        if not result:
+            return "{}"
+
+        result_dict = result.model_dump(exclude_defaults=True)
+        return json.dumps(result_dict, indent=2)
+
+    def format_list(self, items: list, title: str, columns: list[str]) -> str:
+        if not items:
+            return "[]"
+
+        formatted_items = []
+        for item in items:
+            if hasattr(item, "model_dump"):
+                formatted_items.append(item.model_dump(exclude_defaults=True))
+            elif isinstance(item, dict):
+                formatted_items.append(item)
+            else:
+                # Convert to dict using specified columns
+                item_dict = {}
+                for col in columns:
+                    if hasattr(item, col):
+                        item_dict[col] = getattr(item, col)
+                formatted_items.append(item_dict)
+
+        return json.dumps(formatted_items, indent=2)
+
+
+class TableOutputFormatter(BaseOutputFormatter):
+    """Table output formatter."""
+
+    def format_result(self, result: Result, title: str = "Result") -> str:
+        if not result:
+            return "No result"
+
+        result_dict = result.model_dump(exclude_defaults=True)
+
+        # For single objects, format as key-value pairs
+        if isinstance(result_dict, dict):
+            lines = []
+            for key, value in result_dict.items():
+                if isinstance(value, (dict, list)):
+                    value = json.dumps(value, indent=2)
+                lines.append(f"{key}: {value}")
+            return "\n".join(lines)
+        else:
+            return str(result_dict)
+
+    def format_list(self, items: list, title: str, columns: list[str]) -> str:
+        if not items:
+            return f"No {title.lower()} available"
+
+        # Calculate column widths
+        col_widths = {}
+        for col in columns:
+            col_widths[col] = len(col)
+
+        # Get all values and calculate max widths
+        all_rows = []
+        for item in items:
+            row = {}
+            for col in columns:
+                if hasattr(item, col):
+                    value = getattr(item, col)
+                elif isinstance(item, dict) and col in item:
+                    value = item[col]
+                else:
+                    value = ""
+
+                if isinstance(value, (dict, list)):
+                    value = json.dumps(value, indent=2)
+                elif value is None:
+                    value = ""
+
+                value_str = str(value)
+                row[col] = value_str
+                col_widths[col] = max(col_widths[col], len(value_str))
+            all_rows.append(row)
+
+        # Format table
+        lines = []
+
+        # Header
+        header = " | ".join(col.ljust(col_widths[col]) for col in columns)
+        lines.append(header)
+        lines.append("-" * len(header))
+
+        # Rows
+        for row in all_rows:
+            line = " | ".join(row[col].ljust(col_widths[col]) for col in columns)
+            lines.append(line)
+
+        return "\n".join(lines)
+
+
+class YamlOutputFormatter(BaseOutputFormatter):
+    """YAML output formatter."""
+
+    def format_result(self, result: Result, title: str = "Result") -> str:
+        if not result:
+            return "null"
+
+        result_dict = result.model_dump(exclude_defaults=True)
+        return yaml.dump(result_dict, default_flow_style=False)
+
+    def format_list(self, items: list, title: str, columns: list[str]) -> str:
+        if not items:
+            return "[]"
+
+        formatted_items = []
+        for item in items:
+            if hasattr(item, "model_dump"):
+                formatted_items.append(item.model_dump(exclude_defaults=True))
+            elif isinstance(item, dict):
+                formatted_items.append(item)
+            else:
+                # Convert to dict using specified columns
+                item_dict = {}
+                for col in columns:
+                    if hasattr(item, col):
+                        item_dict[col] = getattr(item, col)
+                formatted_items.append(item_dict)
+
+        return yaml.dump(formatted_items, default_flow_style=False)
+
+
+class RawOutputFormatter(BaseOutputFormatter):
+    """Raw output formatter."""
+
+    def format_result(self, result: Result, title: str = "Result") -> str:
+        if not result:
+            return ""
+
+        # For raw output, try to extract the most relevant content
+        result_dict = result.model_dump(exclude_defaults=True)
+
+        # Check for content array (common in MCP responses)
+        if isinstance(result_dict, dict) and "content" in result_dict:
+            content = result_dict["content"]
+            if isinstance(content, list) and len(content) > 0:
+                if (
+                    len(content) == 1
+                    and isinstance(content[0], dict)
+                    and "text" in content[0]
+                ):
+                    return content[0]["text"]
+
+        # Check for contents (resources)
+        if isinstance(result_dict, dict) and "contents" in result_dict:
+            contents = result_dict["contents"]
+            if isinstance(contents, list) and len(contents) > 0:
+                content = contents[0]
+                if isinstance(content, dict):
+                    if "text" in content:
+                        return content["text"]
+                    elif "blob" in content:
+                        return content["blob"]
+
+        # Check for structured content (tool results)
+        if isinstance(result_dict, dict) and "structuredContent" in result_dict:
+            structured_content = result_dict["structuredContent"]
+            if isinstance(structured_content, dict) and "result" in structured_content:
+                return str(structured_content["result"])
+
+        # Fall back to string representation
+        return str(result_dict)
+
+    def format_list(self, items: list, title: str, columns: list[str]) -> str:
+        if not items:
+            return ""
+
+        # For raw output, just return the most relevant field from each item
+        lines = []
+        for item in items:
+            if hasattr(item, "name"):
+                lines.append(str(getattr(item, "name")))
+            elif hasattr(item, "uri"):
+                lines.append(str(getattr(item, "uri")))
+            elif isinstance(item, dict):
+                if "name" in item:
+                    lines.append(str(item["name"]))
+                elif "uri" in item:
+                    lines.append(str(item["uri"]))
+                else:
+                    lines.append(str(item))
+            else:
+                lines.append(str(item))
+
+        return "\n".join(lines)
+
+
+def get_output_formatter(config: OutputConfig) -> BaseOutputFormatter:
+    """Get the appropriate output formatter based on config."""
+    if config.output_format == "json":
+        return JsonOutputFormatter(config)
+    elif config.output_format == "pretty":
+        return PrettyOutputFormatter(config)
+    elif config.output_format == "table":
+        return TableOutputFormatter(config)
+    elif config.output_format == "yaml":
+        return YamlOutputFormatter(config)
+    elif config.output_format == "raw":
+        return RawOutputFormatter(config)
+    else:
+        return JsonOutputFormatter(config)
+
+
+# Exit codes as defined in the spec
+EXIT_SUCCESS = 0
+EXIT_CLI_ERROR = 1
+EXIT_SERVER_ERROR = 2
+EXIT_INVALID_INPUT = 3
+
+
+def exit_with_code(code: int, message: str = "", quiet: bool = False):
+    """Exit with appropriate code and message."""
+    if message and not quiet:
+        if code == EXIT_SUCCESS:
+            print(message)
+        else:
+            print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+def print_error(message: str, session: "MCPSession | None" = None):
+    """Print error message to stderr, respecting quiet mode."""
+    if session and session.output_config and session.output_config.quiet:
+        return
+    if session and session.output_formatter:
+        session.output_formatter.format_error(message)
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+
+
+def print_warning(message: str, session: "MCPSession | None" = None):
+    """Print warning message to stderr, respecting quiet mode."""
+    if session and session.output_config and session.output_config.quiet:
+        return
+    print(f"Warning: {message}", file=sys.stderr)
 
 
 class CommandConfig:
@@ -289,6 +612,7 @@ class MCPSession:
         cmd_or_url: str,
         metadata: dict[str, str] | None = None,
         force_sse: bool = False,
+        output_config: OutputConfig | None = None,
     ):
         self.cmd_or_url = cmd_or_url
         self.metadata = metadata or {}
@@ -299,6 +623,11 @@ class MCPSession:
         self.server_info = None
         self.clean_output = False
         self.session_id_callback = None  # For Streamable HTTP
+        self.output_config = output_config
+        self.output_formatter = (
+            get_output_formatter(output_config) if output_config else None
+        )
+        self._completion_cache = {}
 
     async def connect(self) -> None:
         """Initialize connection to MCP server."""
@@ -309,18 +638,18 @@ class MCPSession:
                 headers = self.metadata or None
 
                 if self.force_sse:
-                    if not self.clean_output:
+                    if not (self.output_config and self.output_config.quiet):
                         console.print("[cyan]→ Using SSE transport (forced)[/cyan]")
                     await self._connect_sse(url, headers)
                 else:
                     try:
-                        if not self.clean_output:
+                        if not (self.output_config and self.output_config.quiet):
                             console.print(
                                 "[cyan]→ Attempting Streamable HTTP transport...[/cyan]"
                             )
                         await self._connect_streamable_http(url, headers)
                     except Exception as e:
-                        if not self.clean_output:
+                        if not (self.output_config and self.output_config.quiet):
                             console.print(
                                 f"[yellow]→ Streamable HTTP failed ({e}), falling back to SSE...[/yellow]"
                             )
@@ -330,7 +659,7 @@ class MCPSession:
                 await self._connect_stdio()
 
             # Initialize session
-            if not self.clean_output:
+            if not (self.output_config and self.output_config.quiet):
                 console.print("[cyan]→ Initializing MCP session...[/cyan]")
             init_result = await self.session.initialize()
             self.server_info = init_result
@@ -427,7 +756,7 @@ class MCPSession:
         # SSE transport - Auto-handle endpoint detection like the blog post describes
         if not url.endswith("/sse"):
             url = urljoin(url, "/sse")
-            if not self.clean_output:
+            if not (self.output_config and self.output_config.quiet):
                 console.print(f"[cyan]→ Auto-detecting SSE endpoint: {url}[/cyan]")
 
         self.client = sse_client(url=url, headers=headers)
@@ -570,13 +899,21 @@ class MCPSession:
         return None
 
 
-def print_result_structured(result: Result, session: MCPSession) -> None:
-    """Print result in structured format - extract clean data."""
+def print_result_structured(
+    result: Result, session: MCPSession, title: str = "Result"
+) -> None:
+    """Print result using the configured output formatter."""
     if not result:
         return
 
-    if session.clean_output:
-        # Extract just the structured content or core data
+    # Use the output formatter if available
+    if session.output_formatter:
+        formatted_output = session.output_formatter.format_result(result, title)
+        session.output_formatter.write(formatted_output)
+        if formatted_output and not formatted_output.endswith("\n"):
+            session.output_formatter.write("\n")
+    elif session.clean_output:
+        # Fallback to old clean output behavior
         try:
             result_dict = result.model_dump(exclude_defaults=True)
 
@@ -626,10 +963,10 @@ def print_result_structured(result: Result, session: MCPSession) -> None:
 
         except Exception:
             # Fallback to normal output if structured extraction fails
-            print_result(result, "Result")
+            print_result(result, title)
     else:
         # Normal pretty output
-        print_result(result, "Result")
+        print_result(result, title)
 
 
 def print_result(result: Result, title: str = "Result") -> None:
@@ -646,38 +983,57 @@ def print_result(result: Result, title: str = "Result") -> None:
     console.print(panel)
 
 
-def print_table(data: list[object], title: str, columns: list[str]) -> None:
-    """Print data in a table format."""
+def print_table(
+    data: list[object],
+    title: str,
+    columns: list[str],
+    session: "MCPSession | None" = None,
+) -> None:
+    """Print data in a table format using the configured output formatter."""
     if not data:
-        console.print(f"[yellow]No {title.lower()} available[/yellow]")
+        if session and session.output_formatter:
+            formatted_output = session.output_formatter.format_list([], title, columns)
+            session.output_formatter.write(formatted_output)
+            if formatted_output and not formatted_output.endswith("\n"):
+                session.output_formatter.write("\n")
+        else:
+            console.print(f"[yellow]No {title.lower()} available[/yellow]")
         return
 
-    table = Table(title=title, show_header=True, header_style="bold magenta")
+    # Use the output formatter if available
+    if session and session.output_formatter:
+        formatted_output = session.output_formatter.format_list(data, title, columns)
+        session.output_formatter.write(formatted_output)
+        if formatted_output and not formatted_output.endswith("\n"):
+            session.output_formatter.write("\n")
+    else:
+        # Fallback to rich table output
+        table = Table(title=title, show_header=True, header_style="bold magenta")
 
-    for col in columns:
-        table.add_column(col)
-
-    for item in data:
-        row = []
         for col in columns:
-            # Handle both dict access and attribute access
-            if hasattr(item, col):
-                value = getattr(item, col)
-            elif isinstance(item, dict) and col in item:
-                value = item[col]
-            else:
-                value = ""
+            table.add_column(col)
 
-            # Convert complex objects to strings
-            if isinstance(value, (dict, list)):
-                value = json.dumps(value, indent=2)
-            elif value is None:
-                value = ""
+        for item in data:
+            row = []
+            for col in columns:
+                # Handle both dict access and attribute access
+                if hasattr(item, col):
+                    value = getattr(item, col)
+                elif isinstance(item, dict) and col in item:
+                    value = item[col]
+                else:
+                    value = ""
 
-            row.append(str(value))
-        table.add_row(*row)
+                # Convert complex objects to strings
+                if isinstance(value, (dict, list)):
+                    value = json.dumps(value, indent=2)
+                elif value is None:
+                    value = ""
 
-    console.print(table)
+                row.append(str(value))
+            table.add_row(*row)
+
+        console.print(table)
 
 
 def print_inspection(info: dict[str, object], title: str) -> None:
@@ -847,6 +1203,7 @@ async def discover_all(mcp_session: MCPSession) -> None:
                 result.resources,
                 "📁 Available Resources",
                 ["uri", "name", "description"],
+                mcp_session,
             )
             console.print("[dim]💡 Try: r read <uri> or r inspect <uri>[/dim]\n")
         else:
@@ -854,7 +1211,7 @@ async def discover_all(mcp_session: MCPSession) -> None:
             console.print("[yellow]📁 No resources available[/yellow]\n")
     except Exception as e:
         mcp_session._completion_cache["resources"] = []
-        console.print(f"[red]📁 Error listing resources: {e}[/red]\n")
+        print_error(f"📁 Error listing resources: {e}", mcp_session)
 
     # Tools
     try:
@@ -864,7 +1221,9 @@ async def discover_all(mcp_session: MCPSession) -> None:
             mcp_session._completion_cache["tools"] = [
                 tool.name for tool in result.tools
             ]
-            print_table(result.tools, "🔧 Available Tools", ["name", "description"])
+            print_table(
+                result.tools, "🔧 Available Tools", ["name", "description"], mcp_session
+            )
             console.print(
                 "[dim]💡 Try: t call <name> [args] or t inspect <name>[/dim]\n"
             )
@@ -873,7 +1232,7 @@ async def discover_all(mcp_session: MCPSession) -> None:
             console.print("[yellow]🔧 No tools available[/yellow]\n")
     except Exception as e:
         mcp_session._completion_cache["tools"] = []
-        console.print(f"[red]🔧 Error listing tools: {e}[/red]\n")
+        print_error(f"🔧 Error listing tools: {e}", mcp_session)
 
     # Prompts
     try:
@@ -883,7 +1242,12 @@ async def discover_all(mcp_session: MCPSession) -> None:
             mcp_session._completion_cache["prompts"] = [
                 prompt.name for prompt in result.prompts
             ]
-            print_table(result.prompts, "💬 Available Prompts", ["name", "description"])
+            print_table(
+                result.prompts,
+                "💬 Available Prompts",
+                ["name", "description"],
+                mcp_session,
+            )
             console.print(
                 "[dim]💡 Try: p get <name> [args] or p inspect <name>[/dim]\n"
             )
@@ -892,7 +1256,7 @@ async def discover_all(mcp_session: MCPSession) -> None:
             console.print("[yellow]💬 No prompts available[/yellow]\n")
     except Exception as e:
         mcp_session._completion_cache["prompts"] = []
-        console.print(f"[red]💬 Error listing prompts: {e}[/red]\n")
+        print_error(f"💬 Error listing prompts: {e}", mcp_session)
 
 
 def show_help() -> None:
@@ -970,9 +1334,14 @@ async def handle_command(mcp_session: MCPSession, cmd: str, parts: list[str]) ->
     if cmd == "ls":
         result = await mcp_session.execute_command("resources", "list")
         if result and hasattr(result, "resources"):
-            print_table(result.resources, "Resources", ["uri", "name", "description"])
+            print_table(
+                result.resources,
+                "Resources",
+                ["uri", "name", "description"],
+                mcp_session,
+            )
         else:
-            print_result(result, "Resources")
+            print_result_structured(result, mcp_session, "Resources")
         return
 
     # Find matching command configuration
@@ -1057,7 +1426,10 @@ async def handle_command(mcp_session: MCPSession, cmd: str, parts: list[str]) ->
             if cmd_type == "resources":
                 if subcmd_name == "list" and result and hasattr(result, "resources"):
                     print_table(
-                        result.resources, "Resources", ["uri", "name", "description"]
+                        result.resources,
+                        "Resources",
+                        ["uri", "name", "description"],
+                        mcp_session,
                     )
                 elif (
                     subcmd_name == "templates"
@@ -1068,19 +1440,24 @@ async def handle_command(mcp_session: MCPSession, cmd: str, parts: list[str]) ->
                         result.templates,
                         "Resource Templates",
                         ["uri", "name", "description"],
+                        mcp_session,
                     )
                 else:
-                    print_result(result, cmd_type.title())
+                    print_result_structured(result, mcp_session, cmd_type.title())
             elif cmd_type == "prompts":
                 if result and hasattr(result, "prompts"):
-                    print_table(result.prompts, "Prompts", ["name", "description"])
+                    print_table(
+                        result.prompts, "Prompts", ["name", "description"], mcp_session
+                    )
                 else:
-                    print_result(result, "Prompts")
+                    print_result_structured(result, mcp_session, "Prompts")
             elif cmd_type == "tools":
                 if result and hasattr(result, "tools"):
-                    print_table(result.tools, "Tools", ["name", "description"])
+                    print_table(
+                        result.tools, "Tools", ["name", "description"], mcp_session
+                    )
                 else:
-                    print_result(result, "Tools")
+                    print_result_structured(result, mcp_session, "Tools")
 
         elif subcmd_name == "info":
             if cmd_type == "server":
@@ -1283,6 +1660,29 @@ async def run_repl(mcp_session: MCPSession) -> None:
     help="Use rich formatting and detailed output (default: clean output)",
 )
 @click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    help="Suppress all non-essential output (no headers, progress, banners)",
+)
+@click.option(
+    "--output",
+    type=click.Choice(["json", "pretty", "table", "yaml", "raw"]),
+    default="json",
+    help="Output format (default: json in non-REPL mode, pretty in REPL mode)",
+)
+@click.option(
+    "-o",
+    "--output-file",
+    type=click.Path(),
+    help="Write output to a file instead of stdout",
+)
+@click.option(
+    "--stdin",
+    is_flag=True,
+    help="Accept input from stdin (JSON or arguments)",
+)
+@click.option(
     "--force-sse",
     is_flag=True,
     help="Force SSE transport instead of Streamable HTTP for HTTP URLs",
@@ -1293,6 +1693,10 @@ def main(
     env: tuple[str],
     header: tuple[str],
     verbose: bool,
+    quiet: bool,
+    output: str,
+    output_file: str,
+    stdin: bool,
     force_sse: bool,
     commands: tuple[str],
 ):
@@ -1330,8 +1734,43 @@ def main(
             key, value = item.split(":", 1)
             metadata[key] = value
 
+    # Handle stdin input if requested
+    stdin_input = None
+    if stdin:
+        if not sys.stdin.isatty():
+            stdin_input = sys.stdin.read().strip()
+            # If stdin is empty after stripping, treat it as no input
+            if not stdin_input:
+                exit_with_code(
+                    EXIT_INVALID_INPUT,
+                    "Error: --stdin flag requires input from stdin",
+                    quiet,
+                )
+        else:
+            exit_with_code(
+                EXIT_INVALID_INPUT,
+                "Error: --stdin flag requires input from stdin",
+                quiet,
+            )
+
+    # Create output configuration
+    # In interactive mode, default to pretty output unless specified
+    # In command-line mode, use specified output format (default: json)
+    actual_output_format = output
+    if not commands and output == "json":
+        actual_output_format = "pretty"  # Default to pretty in REPL mode
+
+    output_config = OutputConfig(
+        output_format=actual_output_format,
+        quiet=quiet,
+        verbose=verbose,
+        output_file=output_file,
+    )
+
     async def run():
-        mcp_session = MCPSession(cmd_or_url, metadata, force_sse)
+        mcp_session = MCPSession(
+            cmd_or_url, metadata, force_sse, output_config=output_config
+        )
         # In interactive mode, always use rich output
         # In command-line mode, use clean output unless --verbose
         mcp_session.clean_output = not verbose and bool(commands)
@@ -1340,7 +1779,7 @@ def main(
 
             # Check if we have commands to execute (non-interactive mode)
             if commands:
-                await run_commands(mcp_session, commands)
+                await run_commands(mcp_session, commands, stdin_input)
             else:
                 # Interactive REPL mode (always verbose)
                 mcp_session.clean_output = False
@@ -1351,19 +1790,67 @@ def main(
     try:
         asyncio.run(run())
     except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted by user[/yellow]")
+        exit_with_code(EXIT_CLI_ERROR, "Interrupted by user", quiet)
+    except json.JSONDecodeError as e:
+        exit_with_code(EXIT_INVALID_INPUT, f"Invalid JSON input: {e}", quiet)
     except Exception as e:
-        console.print(f"[red]Fatal error: {e}[/red]")
-        sys.exit(1)
+        # Check if it's a server-related error
+        if "server" in str(e).lower() or "mcp" in str(e).lower():
+            exit_with_code(EXIT_SERVER_ERROR, f"Server error: {e}", quiet)
+        else:
+            exit_with_code(EXIT_CLI_ERROR, f"Fatal error: {e}", quiet)
 
 
-async def run_commands(mcp_session: MCPSession, commands: tuple[str]) -> None:
+async def run_commands(
+    mcp_session: MCPSession, commands: tuple[str], stdin_input: str | None = None
+) -> None:
     """Execute commands in non-interactive mode."""
     # Join all command arguments into a single command string
     command_string = " ".join(commands)
 
-    # Check if we should read from stdin (for piping support)
-    if not sys.stdin.isatty():
+    # Handle stdin input
+    if stdin_input:
+        # Try to parse stdin as JSON first
+        try:
+            stdin_data = json.loads(stdin_input)
+            # If it's a dict, it could be arguments for a command
+            if isinstance(stdin_data, dict) and command_string:
+                # For commands that accept arguments, use the JSON as arguments
+                parts = command_string.split()
+                if len(parts) >= 2 and parts[1] in ["call", "get"]:
+                    # Convert dict to JSON string and append to command
+                    command_string += f" '{json.dumps(stdin_data)}'"
+                elif len(parts) >= 2 and parts[1] == "read":
+                    # For read commands, extract the URI/name from the JSON
+                    if isinstance(stdin_data, dict) and "uri" in stdin_data:
+                        command_string += f" {stdin_data['uri']}"
+                    elif isinstance(stdin_data, dict) and "name" in stdin_data:
+                        command_string += f" {stdin_data['name']}"
+            elif isinstance(stdin_data, dict) and not command_string:
+                # If we have JSON input but no command, check if it contains URI/name for resource read
+                if "uri" in stdin_data:
+                    command_string = f"resource read {stdin_data['uri']}"
+                elif "name" in stdin_data:
+                    command_string = f"resource read {stdin_data['name']}"
+                else:
+                    # Generic JSON without URI/name, default to resource read with the whole JSON
+                    command_string = f"resource read '{json.dumps(stdin_data)}'"
+        except json.JSONDecodeError:
+            # If not valid JSON, treat as plain text
+            if stdin_input and not command_string:
+                # If we have stdin input but no command, assume it's a resource URI to read
+                command_string = f"resource read {stdin_input}"
+            elif (
+                stdin_input
+                and "read" in command_string
+                and len(command_string.split()) == 2
+            ):
+                # If command is like "resource read" and we have stdin, use stdin as the URI
+                command_string += f" {stdin_input}"
+
+    # Check if we should read from stdin (for backward compatibility)
+    # Only do this if stdin_input was not explicitly provided (None vs empty string)
+    elif stdin_input is None and not sys.stdin.isatty():
         stdin_input = sys.stdin.read().strip()
         if stdin_input and not command_string:
             # If we have stdin input but no command, assume it's a resource URI to read
@@ -1379,8 +1866,9 @@ async def run_commands(mcp_session: MCPSession, commands: tuple[str]) -> None:
     # Parse the command
     parts = command_string.split()
     if not parts:
-        console.print("[red]Error: No command provided[/red]")
-        sys.exit(1)
+        # Instead of exiting, call handle_command with empty parts to let it handle the error
+        await handle_command(mcp_session, "", [])
+        return
 
     cmd = parts[0].lower()
 
