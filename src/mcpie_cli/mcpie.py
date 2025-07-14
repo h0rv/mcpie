@@ -309,33 +309,38 @@ class MCPSession:
                 headers = self.metadata or None
 
                 if self.force_sse:
-                    console.print("[cyan]→ Using SSE transport (forced)[/cyan]")
+                    if not self.clean_output:
+                        console.print("[cyan]→ Using SSE transport (forced)[/cyan]")
                     await self._connect_sse(url, headers)
                 else:
                     try:
-                        console.print(
-                            "[cyan]→ Attempting Streamable HTTP transport...[/cyan]"
-                        )
+                        if not self.clean_output:
+                            console.print(
+                                "[cyan]→ Attempting Streamable HTTP transport...[/cyan]"
+                            )
                         await self._connect_streamable_http(url, headers)
                     except Exception as e:
-                        console.print(
-                            f"[yellow]→ Streamable HTTP failed ({e}), falling back to SSE...[/yellow]"
-                        )
+                        if not self.clean_output:
+                            console.print(
+                                f"[yellow]→ Streamable HTTP failed ({e}), falling back to SSE...[/yellow]"
+                            )
                         await self._connect_sse(url, headers)
             else:
                 # STDIO transport
                 await self._connect_stdio()
 
             # Initialize session
-            console.print("[cyan]→ Initializing MCP session...[/cyan]")
+            if not self.clean_output:
+                console.print("[cyan]→ Initializing MCP session...[/cyan]")
             init_result = await self.session.initialize()
             self.server_info = init_result
             self.initialized = True
 
-            console.print("[green]✓ Connected to MCP server[/green]")
+            if not self.clean_output:
+                console.print("[green]✓ Connected to MCP server[/green]")
 
             # Show server info automatically - handle different object types safely
-            if self.server_info:
+            if self.server_info and not self.clean_output:
                 try:
                     # Try different ways to access server info
                     server_info = None
@@ -404,9 +409,10 @@ class MCPSession:
                 url = url + "mcp"
             else:
                 url = url + "/mcp"
-            console.print(
-                f"[cyan]→ Auto-detecting Streamable HTTP endpoint: {url}[/cyan]"
-            )
+            if not self.clean_output:
+                console.print(
+                    f"[cyan]→ Auto-detecting Streamable HTTP endpoint: {url}[/cyan]"
+                )
 
         self.client = streamablehttp_client(url=url, headers=headers)
         read, write, session_id_callback = await self.client.__aenter__()
@@ -421,7 +427,8 @@ class MCPSession:
         # SSE transport - Auto-handle endpoint detection like the blog post describes
         if not url.endswith("/sse"):
             url = urljoin(url, "/sse")
-            console.print(f"[cyan]→ Auto-detecting SSE endpoint: {url}[/cyan]")
+            if not self.clean_output:
+                console.print(f"[cyan]→ Auto-detecting SSE endpoint: {url}[/cyan]")
 
         self.client = sse_client(url=url, headers=headers)
         read, write = await self.client.__aenter__()
