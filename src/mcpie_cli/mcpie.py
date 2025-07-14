@@ -665,10 +665,11 @@ class MCPSession:
             self.server_info = init_result
             self.initialized = True
 
-            console.print("[green]✓ Connected to MCP server[/green]")
+            if not self.clean_output:
+                console.print("[green]✓ Connected to MCP server[/green]")
 
             # Show server info automatically - handle different object types safely
-            if self.server_info:
+            if self.server_info and not self.clean_output:
                 try:
                     # Try different ways to access server info
                     server_info = None
@@ -737,9 +738,10 @@ class MCPSession:
                 url = url + "mcp"
             else:
                 url = url + "/mcp"
-            console.print(
-                f"[cyan]→ Auto-detecting Streamable HTTP endpoint: {url}[/cyan]"
-            )
+            if not self.clean_output:
+                console.print(
+                    f"[cyan]→ Auto-detecting Streamable HTTP endpoint: {url}[/cyan]"
+                )
 
         self.client = streamablehttp_client(url=url, headers=headers)
         read, write, session_id_callback = await self.client.__aenter__()
