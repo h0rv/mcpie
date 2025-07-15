@@ -1,14 +1,6 @@
-#!/usr/bin/env python3
-"""
-Interactive MCP Client with REPL interface
-A human-friendly command-line tool for interacting with MCP servers.
-
-Solves the pain points described in:
-https://deadprogrammersociety.com/2025/03/calling-mcp-servers-the-hard-way.html
-"""
-
 import asyncio
 import json
+import logging
 import shlex
 import sys
 from urllib.parse import urljoin
@@ -27,11 +19,42 @@ from prompt_toolkit.lexers import PygmentsLexer
 from prompt_toolkit.styles import Style
 from pygments.lexers.data import JsonLexer
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
+# Configure logging to use Rich and output to stderr
+# This prevents server logs from polluting stdout when piping
+logging.basicConfig(
+    level=logging.WARNING,  # Only show warnings and errors by default
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[
+        RichHandler(
+            console=Console(stderr=True),  # Force output to stderr
+            rich_tracebacks=True,
+            markup=True,
+            show_time=True,
+            show_path=False,
+        )
+    ],
+)
+
+# Set up logger for this module
+logger = logging.getLogger(__name__)
+
+# Suppress noisy loggers from libraries
+logging.getLogger("mcp").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+# Main console for regular output (stdout)
 console = Console()
+
+# Separate console for status messages and non-essential output (stderr)
+console_err = Console(stderr=True)
 
 
 class OutputConfig:
@@ -613,10 +636,12 @@ class MCPSession:
         metadata: dict[str, str] | None = None,
         force_sse: bool = False,
         output_config: OutputConfig | None = None,
+        debug_mode: bool = False,
     ):
         self.cmd_or_url = cmd_or_url
         self.metadata = metadata or {}
         self.force_sse = force_sse  # Force SSE instead of Streamable HTTP
+        self.debug_mode = debug_mode  # Debug mode flag
         self.session: ClientSession | None = None
         self.client = None
         self.initialized = False
@@ -631,6 +656,9 @@ class MCPSession:
 
     async def connect(self) -> None:
         """Initialize connection to MCP server."""
+        # Determine which console to use for status messages
+        status_console = console_err if self.clean_output else console
+
         try:
             if self.cmd_or_url.startswith(("http://", "https://")):
                 # HTTP transport - try Streamable HTTP first, fallback to SSE
@@ -639,18 +667,20 @@ class MCPSession:
 
                 if self.force_sse:
                     if not (self.output_config and self.output_config.quiet):
-                        console.print("[cyan]→ Using SSE transport (forced)[/cyan]")
+                        status_console.print(
+                            "[cyan]→ Using SSE transport (forced)[/cyan]"
+                        )
                     await self._connect_sse(url, headers)
                 else:
                     try:
                         if not (self.output_config and self.output_config.quiet):
-                            console.print(
+                            status_console.print(
                                 "[cyan]→ Attempting Streamable HTTP transport...[/cyan]"
                             )
                         await self._connect_streamable_http(url, headers)
                     except Exception as e:
                         if not (self.output_config and self.output_config.quiet):
-                            console.print(
+                            status_console.print(
                                 f"[yellow]→ Streamable HTTP failed ({e}), falling back to SSE...[/yellow]"
                             )
                         await self._connect_sse(url, headers)
@@ -660,13 +690,13 @@ class MCPSession:
 
             # Initialize session
             if not (self.output_config and self.output_config.quiet):
-                console.print("[cyan]→ Initializing MCP session...[/cyan]")
+                status_console.print("[cyan]→ Initializing MCP session...[/cyan]")
             init_result = await self.session.initialize()
             self.server_info = init_result
             self.initialized = True
 
             if not self.clean_output:
-                console.print("[green]✓ Connected to MCP server[/green]")
+                status_console.print("[green]✓ Connected to MCP server[/green]")
 
             # Show server info automatically - handle different object types safely
             if self.server_info and not self.clean_output:
@@ -713,7 +743,7 @@ class MCPSession:
                             if session_id:
                                 session_info = f" (Session: {session_id[:8]}...)"
 
-                        console.print(
+                        status_console.print(
                             f"[dim]Server: {server_name} v{server_version} (Protocol: {protocol_version or 'Unknown'}){session_info}[/dim]"
                         )
                 except Exception:
@@ -721,13 +751,16 @@ class MCPSession:
                     pass
 
         except Exception as e:
-            console.print(f"[red]✗ Failed to connect: {e}[/red]")
+            status_console.print(f"[red]✗ Failed to connect: {e}[/red]")
             raise
 
     async def _connect_streamable_http(
         self, url: str, headers: dict[str, str] | None = None
     ) -> None:
         """Connect using Streamable HTTP transport."""
+        # Determine which console to use for status messages
+        status_console = console_err if self.clean_output else console
+
         # Streamable HTTP typically uses a /mcp endpoint (FastMCP default)
         # but can also be /message or other paths depending on implementation
         streamable_paths = ["/mcp", "/message", "/messages"]
@@ -739,7 +772,7 @@ class MCPSession:
             else:
                 url = url + "/mcp"
             if not self.clean_output:
-                console.print(
+                status_console.print(
                     f"[cyan]→ Auto-detecting Streamable HTTP endpoint: {url}[/cyan]"
                 )
 
@@ -753,11 +786,16 @@ class MCPSession:
         self, url: str, headers: dict[str, str] | None = None
     ) -> None:
         """Connect using SSE transport."""
+        # Determine which console to use for status messages
+        status_console = console_err if self.clean_output else console
+
         # SSE transport - Auto-handle endpoint detection like the blog post describes
         if not url.endswith("/sse"):
             url = urljoin(url, "/sse")
             if not (self.output_config and self.output_config.quiet):
-                console.print(f"[cyan]→ Auto-detecting SSE endpoint: {url}[/cyan]")
+                status_console.print(
+                    f"[cyan]→ Auto-detecting SSE endpoint: {url}[/cyan]"
+                )
 
         self.client = sse_client(url=url, headers=headers)
         read, write = await self.client.__aenter__()
@@ -771,10 +809,30 @@ class MCPSession:
             raise ValueError("stdio command is empty")
 
         command, args = elements[0], elements[1:]
+
+        # Prepare environment with logging suppression
+        env = self.metadata.copy() if self.metadata else {}
+
+        # Set common environment variables to suppress server logs
+        # These are commonly used by Python logging frameworks
+        env.setdefault("PYTHONUNBUFFERED", "1")  # Ensure output is not buffered
+
+        # If not in debug mode, try to suppress server logging
+        if not (hasattr(self, "debug_mode") and self.debug_mode):
+            # Common environment variables to suppress logs
+            env.setdefault("LOG_LEVEL", "ERROR")
+            env.setdefault("LOGLEVEL", "ERROR")
+            env.setdefault("PYTHON_LOG_LEVEL", "ERROR")
+            env.setdefault("MCP_LOG_LEVEL", "ERROR")
+            env.setdefault("FASTMCP_LOG_LEVEL", "ERROR")
+            # Suppress FastAPI/Uvicorn logs specifically
+            env.setdefault("UVICORN_LOG_LEVEL", "error")
+            env.setdefault("UVICORN_ACCESS_LOG", "0")
+
         server_params = StdioServerParameters(
             command=command,
             args=args,
-            env=self.metadata or None,
+            env=env,
         )
         self.client = stdio_client(server_params)
         read, write = await self.client.__aenter__()
@@ -1666,13 +1724,14 @@ async def run_repl(mcp_session: MCPSession) -> None:
     help="Suppress all non-essential output (no headers, progress, banners)",
 )
 @click.option(
+    "-o",
     "--output",
     type=click.Choice(["json", "pretty", "table", "yaml", "raw"]),
     default="json",
     help="Output format (default: json in non-REPL mode, pretty in REPL mode)",
 )
 @click.option(
-    "-o",
+    "-f",
     "--output-file",
     type=click.Path(),
     help="Write output to a file instead of stdout",
@@ -1687,6 +1746,11 @@ async def run_repl(mcp_session: MCPSession) -> None:
     is_flag=True,
     help="Force SSE transport instead of Streamable HTTP for HTTP URLs",
 )
+@click.option(
+    "--debug",
+    is_flag=True,
+    help="Enable debug logging to stderr (shows detailed protocol messages)",
+)
 @click.argument("commands", nargs=-1, required=False)
 def main(
     cmd_or_url: str,
@@ -1698,6 +1762,7 @@ def main(
     output_file: str,
     stdin: bool,
     force_sse: bool,
+    debug: bool,
     commands: tuple[str],
 ):
     """Interactive MCP client with REPL interface and command-line execution.
@@ -1726,6 +1791,23 @@ def main(
     Use '--' to separate server command from MCP commands to execute.
     Use --verbose for rich formatting in command-line mode.
     """
+
+    # Configure logging level based on flags
+    if debug:
+        # Debug mode: show all logs including from libraries
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("mcp").setLevel(logging.DEBUG)
+        logging.getLogger("httpx").setLevel(logging.DEBUG)
+        logging.getLogger("httpcore").setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled")
+    elif verbose and not commands:
+        # Interactive verbose mode: show info logs
+        logging.getLogger().setLevel(logging.INFO)
+        logger.info("Verbose logging enabled")
+    elif quiet:
+        # Quiet mode: only show errors
+        logging.getLogger().setLevel(logging.ERROR)
+    # Otherwise keep the default WARNING level
 
     # Parse metadata
     metadata = {}
@@ -1769,7 +1851,11 @@ def main(
 
     async def run():
         mcp_session = MCPSession(
-            cmd_or_url, metadata, force_sse, output_config=output_config
+            cmd_or_url,
+            metadata,
+            force_sse,
+            output_config=output_config,
+            debug_mode=debug,
         )
         # In interactive mode, always use rich output
         # In command-line mode, use clean output unless --verbose
